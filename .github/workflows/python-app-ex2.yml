@@ -33,4 +33,5 @@ jobs:
         pip3 install -r requirements.txt
     - name: Test Ex2
       run: |
+        cd Ex2
         python3 ex2.py
