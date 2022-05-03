@@ -28,9 +28,9 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
+        cd Ex2
         python3 -m pip install --upgrade pip
         pip3 install -r requirements.txt
-    - name: Unit test of Ex2
+    - name: Test Ex2
       run: |
-        cd Ex2
-        python3 test.py
+        python3 ex2.py

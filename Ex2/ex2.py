@@ -1,260 +1,305 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+Created on Mon May 10 17:01:31 2021
 
-@author: Simon Matern
+@author: semjon
 """
-import numpy as np
-import cv2 as cv
-import sys
-import utils
-from functools import reduce
-import pickle
 
-def binarizeImage(img):
+import cv2
+import utils
+import numpy as np
+from matplotlib import pyplot as plt
+
+def nonMaxSuprression(img, d=5):
     """
-    This method creates a binary image from a colored or grayscale image. 
-    To improve the performance of the segmentation all structures should be 
-    separated using morphological operations, e.g. leaves should not be 
-    connected with each other.
+    Given an image set all values to 0 that are not
+    the maximum in this (2d+1,2d+1)-window
 
     Parameters
     ----------
     img : ndarray
-        An input image with shape (H,W,C) or (H,W)
+        an image
+    d : int
+        for each pixels consider the surrounding (2d+1,2d+1)-window
 
     Returns
     -------
     result : ndarray
-        A binary image with background pixel = 0 and foreground pixel = 255.
-        The shape should be (H,W).
 
     """
-    
-    
-    # converts the image to grayscale if it was
-    img = img.copy()
-    if len(img.shape)>2 and img.shape[2]==3:
-        img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    
-    #TODO:
-    # ---- Binarize Image ----
-    # Given a grayscale image, compute a binary representation 
-    # Background pixel = 0
-    # Foreground pixel = 255
+    rows,cols = img.shape
+    result = np.zeros((rows,cols))
+    for i in range(rows):
+        for j in range(cols):
+            low_y = max(0, i-d)
+            low_x = max(0, j-d)
+            
+            high_y = min(rows, i+d) 
+            high_x = min(cols, j+d) 
+            
+            max_val = img[low_y:high_y,low_x:high_x].max()
+            
+            if img[i,j] == max_val:
+                result[i,j] = max_val
+    return result
 
-    _, res = cv.threshold(img,127,255,cv.THRESH_BINARY_INV)
-    # res = np.where(img > 127, 0, 255)
-
-
-    #TODO (optional):
-    # ---- Erosion ----
-    # Use morphological erosion to remove small connections between structures
-
-    #utils.show(res)
-    
-    return res
-
-def extractContours(img):
+def rotateAndScale(img, angle, scale):
     """
-    This method ectracts contours from a binary images. 
-    The resulting contours/shapes are stored in a list. 
-    Each shape is represented by its 2d points using an ndarray of size (N,2)
+    Rotate and scale an image
 
     Parameters
     ----------
     img : ndarray
-        A binary image
+        an image
+    angle : float
+        angle given in degrees
+    scale : float
+        scaling of the image
 
     Returns
     -------
-    shapes : list[ndarray]
-        A list of shapes.
+    result : ndarray
+        a distorted image
 
     """
-    contours, hierarchy =  cv.findContours(img, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
-    utils.visualizeContours(img, contours)
+    
+    h, w = img.shape
+    (cX, cY) = (w // 2, h // 2)
 
-    shapes = []
-    for cnt in contours:
-        N = len(cnt)
-        shape = cnt.reshape((N,2))
-        shapes.append(shape)
-    return shapes
+    M = cv2.getRotationMatrix2D((cX, cY), angle, scale)
 
+    corners = np.array([[0, 0, 1],[0, h, 1], [w, 0, 1], [w, h, 1]]).T
+    corners = M @ corners
+    
+    shift = corners.min(1)
+    M[:,2]-= shift    
+    
+    b = corners.max(1)-corners.min(1)
+    result = cv2.warpAffine(img, M, (int(b[0]),int(b[1])))
+    return result
 
-def getFourierDescriptor(shape):
+def calcDirectionalGrad(img):
     """
-    Compute the Fourier descriptor of a shape. 
-    Please use numpy.fft.fft() for the fourier transform. 
-    Otherwise there might be type conflicts.
-    
-    See: https://numpy.org/doc/stable/reference/routines.fft.html#module-numpy.fft
-    
+    Computes the gradients in x- and y-direction.
+    The resulting gradients are stored as complex numbers.
+
     Parameters
     ----------
-    shape : ndarray
-        A shape described by an array of size (N,2). 
-        Where N is the number of points.
+    img : ndarray
+        an image
 
     Returns
     -------
-    fd : ndarray
-        The fourier descriptor described by an array of size N.
-        Note, that the output should contain complex numbers.
-        
-        Also note, that the 0th frequency is at fd[0]. 
-        fd[1:n/2] contains all positive frequencies.
-        fd[n/2:]  contains all negative frequencise.  
-        See documentation for details
+    ndarray
+        The array is stored in the following format: grad_x+ i*grad_y
     """
+    sobelx = cv2.Sobel(img,cv2.CV_64F,1,0,ksize=5)
+    sobely = cv2.Sobel(img,cv2.CV_64F,0,1,ksize=5)
     
-    # Compute fourier descriptor of shape
-    ft = shape[:, 0] + 1j * shape[:, 1]
-    res = np.fft.fft(ft)
-    
-    return res
+    return sobelx + 1.0j*sobely
 
-def normalizeFourierDescriptor(fd, n_freq):
+
+def circularShift(img, dx, dy):
     """
-    Given a Fourier descriptor and the number of frequencies, normalize
-    the Fourier Descriptor and reduce the number of frequencies to n_freq.
-    
-    Note, that you have to remove the higher frequencies, 
-    i.e. keep n_freq/2 lowest positive frequencies and n_freq/2 lowest negative frequencies.
+    Performs a circular shift and puts the new origin into position (dx,dy)
 
     Parameters
     ----------
-    fd : ndarray
-        An unnormalized Fourier descriptor
-    n_freq : int
-        number of frequencies to represent the normalized FD
+    img : ndarray
+        an image
+    dx : int
+        x coordinate
+    dy : int
+        y coordinate
 
     Returns
     -------
-    nfd : ndarray
-        A normalized Fourier descriptor. 
+    result : ndarray
+        image with new center
 
     """
+    img = img.copy()
+    result = np.zeros_like(img)
+    H,W = img.shape
     
-    fd = fd.copy()
-    
-    # # TODO:
-    # # Translation Invariance F(0) := 0
-    # res = np.zeros(n_freq)
- 
-    # # TODO:   
-    # # Scale Invariance F(i) := F(i)/|F(1)|
-    # F_1 = fd[0].real
-    # res[1:] = fd[0:].real / F_1
-    
+    result[:-dy,:-dx] = img[dy:,dx:]
+    result[:-dy,-dx:] = img[dy:,:dx]
+    result[-dy:,:-dx] = img[:dy,dx:]
+    result[-dy:,-dx:] = img[:dy,:dx]
 
-    # # TODO:   
-    # # Rotation Invariance, starting point invariance etc.
-    # # F := |F|
+    return result
 
-    # # TODO:       
-    # # Filter higher frequencies
-    res = np.zeros(n_freq)
-    fScale = fd[1].real
-    for i in range(1, n_freq//2):
-        res[i] = np.abs(fd[i].real / fScale)
-        res[n_freq-1-i] = np.abs(fd[n_freq-1-i].real / fScale)
-    res[0] = 0
-    return res
-
-def classifyFourierDescriptor(nfd, nfd_templates, thresh):
+def calcBinaryMask(img, thresh = 0.3):
     """
-    Given a single normalized Fourier descriptor of shape and a list of 
-    normalized Fourier descriptor of the templates, classify the the shape.
-    
-    Use the following metric: d(x,y) = np.linalg.norm(x-y)/N  ,where N is the 
-    length of the descriptor.
+    Compute the gradient of an image and compute a binary mask
+    based on the threshold. Corresponds to O^B in the slides.
 
     Parameters
     ----------
-    nfd : ndarray
-        normalized Fourier descriptor of some shape.
-    nfd_templates : list[ndarrray]
-        list of normalized Fourier descriptor of the templates.
+    img : ndarray
+        an image
     thresh : float
-        a classification is only considered if the metric is below this threshold.
-        Otherwise return -1
+        A threshold value. The default is 0.3.
 
     Returns
     -------
-    index : int
-        The index of the corresponding class. 
-        0 is the first class (first template), 1 is the second class (second template)..
-        If the dissimilarity is too large return -1 
+    binary : ndarray
+        A binary image.
+
+    """
+
+    # TODO: 
+    # -compute gradients
+    data = np.copy(img)
+    grad = calcDirectionalGrad(data)
+    real_grad = np.abs(grad)
+
+    # -threshold gradients 
+    maximum = np.amax(real_grad)
+    res = np.where(real_grad > thresh * maximum, 0, 255)
+    return res
+
+
+def correlation(img, template):
+    """
+    Compute a correlation of gradients between an image and a template.
+    
+    Note:
+    You should use the formula in the slides using the fourier transform.
+    Then you are guaranteed to succeed.
+    
+    However, you can also compute the correlation directly. 
+    The resulting image must have high positive values at positions
+    with high correlation.
+
+    Parameters
+    ----------
+    img : ndarray
+        a grayscale image
+    template : ndarray
+        a grayscale image of the template
+
+    Returns
+    -------
+    ndarray
+        an image containing the correlation between image and template gradients.
     """
     
-    index = -1
+    # TODO:
+    # -compute gradient of the image
+    # (225, 300)
+    img_grad = calcDirectionalGrad(np.copy(img))
+    # -compute gradient of the template
+    # (48, 80)
+    temp_grad = calcDirectionalGrad(np.copy(template))
+
+    # -copy template gradient into larger frame
+    larger_frame = np.zeros(img_grad.shape, dtype=complex)
+    x, y = temp_grad.shape
+    copy = np.copy(temp_grad)
+    larger_frame[:x, :y] = copy
+
+    # -apply a circular shift so the center of the original template is in the
+    #   upper left corner
+    corr = circularShift(larger_frame, x//2, y//2)
+    data = np.copy(corr)
+
+    # -normalize template
+    OI = corr / np.sum(np.abs(data))
+    OB = calcBinaryMask(img)
+    T = OI * OB
     
+    # -compute correlation
+    res = np.abs((np.fft.ifft(np.fft.fft(img_grad) * np.conj(np.fft.fft(T)))).real)
+
+    return res
+
+
+
+def GeneralizedHoughTransform(img, template, angles, scales):
+    """
+    Compute the generalized hough transform. Given an image and a template.
     
-    return index
+    Parameters
+    ----------
+    img : ndarray
+        A query image
+    template : ndarray
+        a template image
+    angles : list[float]
+        A list of angles provided in degrees
+    scales : list[float]
+        A list of scaling factors
 
-
-def imageSegmentation(img, templates, n_freq, thresh):
-    query = binarizeImage(img)
-    shapes = extractContours(query)
-    shapes = [shape for shape in shapes if len(shape) > n_freq]
-
-
-    utils.visualizeShapes(img, shapes, (255,255,255))
-    fds = [getFourierDescriptor(shape) for shape in shapes]
-    nfds = [normalizeFourierDescriptor(fd, n_freq) for fd in fds]
-
-    nfd_templates = []
-    for template in templates:
-        binary = binarizeImage(template)
-        templ_shapes = extractContours(binary)
-        templ_shapes = [shape for shape in templ_shapes if len(shape) > n_freq]
+    Returns
+    -------
+    hough_table : list[(correlation, angle, scaling)]
+        The resulting hough table is a list of tuples.
+        Each tuple contains the correlation and the corresponding combination
+        of angle and scaling factors of the template.
         
-        if len(templ_shapes) == 0:
-            continue
-        largest_shape = reduce((lambda x, y: x if len(x) > len(y) else y), templ_shapes)
-        fd = getFourierDescriptor(largest_shape)
-        nfd = normalizeFourierDescriptor(fd, n_freq)
-        nfd_templates.append(nfd)
+        Note the order of these values.
+    """
+    # TODO:
+    # for every combination of angles and scales 
+    # -distort template
+    # -compute the correlation
+    # -store results with parameters in a list
+    res = []
+    for i in range(len(angles)):
+        angle = angles[i]
+        angle_arr = np.zeros(2)
+        angle_arr[0] = np.cos(angle)
+        angle_arr[1] = np.sin(angle)
 
-    classification = [classifyFourierDescriptor(nfd, nfd_templates, thresh) for nfd in nfds]
+        for j in range(len(scales)):
+            scale = scales[j]       
+            rows,cols = template.shape
+            M = cv2.getRotationMatrix2D(((cols-1)/2.0, (rows-1)/2.0), angle, scale)
+            dst = cv2.warpAffine(template, M, (cols,rows))
 
-    classes = []
-    labels = np.zeros(img.shape, np.uint8)
-    for i in range(len(templates)):
-        class_i = list(filter(lambda x: x[1] == i, enumerate(classification)))
-        shapes_i = [shapes[x[0]] for x in class_i]
+            corr = correlation(img, dst)
+            temp = (corr, angle, scale)
+            res.append(temp)
+    return res
 
-        color = (0,0,0)
-        if i == 0:
-            color = (255,0,0)
-        elif i == 1:
-            color = (0,255,0)
-        else:
-            color = (np.random.randint(1,255),np.random.randint(1,255),np.random.randint(1,255))
-        labels = utils.visualizeShapes(labels, shapes_i, color)
-        classes.append(shapes_i)
 
-    return classes, labels
 
-if __name__=="__main__":    
-    template1 = cv.imread("data/template1.jpg")
-    utils.show(template1)
+
+if __name__=="__main__":
     
-    template2 = cv.imread("data/template2.jpg")
-    utils.show(template2)
-    templates = [template1, template2]
-
-
-    img = cv.imread("data/query.jpg")
-    utils.show(img)
-
-    n_freq = 30
-    thresh = 0.5
+    # Load query image and template 
+    query = cv2.imread("data/query.jpg", cv2.IMREAD_GRAYSCALE)
+    template = cv2.imread("data/template.jpg", cv2.IMREAD_GRAYSCALE)
     
-    imageSegmentation(img, templates, n_freq, thresh)
+    # Visualize images
+    utils.show(query)
+    utils.show(template)
 
+    # # Create search space and compute GHT
+    angles = np.linspace(0, 360, 36)
+    scales = np.linspace(0.9, 1.3, 10)
+    ght = GeneralizedHoughTransform(query, template, angles, scales)
     
-        
+    # extract votes (correlation) and parameters
+    votes, thetas, s = zip(*ght)
     
+    # Visualize votes
+    votes = np.stack(votes).max(0)
+    plt.imshow(votes)
+    plt.show()
+
+    # nonMaxSuprression
+    votes = nonMaxSuprression(votes, 20)
+    plt.imshow(votes)
+    plt.show()
+
+    # Visualize n best matches
+    n = 10
+    coords = zip(*np.unravel_index(np.argpartition(votes, -n, axis=None)[-n:], votes.shape))
+    vis = np.stack(3*[query],2)
+    for y,x in coords:
+        print(x,y)
+        vis = cv2.circle(vis,(x,y), 10, (255,0,0), 2)
+    utils.show(vis)
