@@ -249,9 +249,6 @@ def GeneralizedHoughTransform(img, template, angles, scales):
     res = []
     for i in range(len(angles)):
         angle = angles[i]
-        angle_arr = np.zeros(2)
-        angle_arr[0] = np.cos(angle)
-        angle_arr[1] = np.sin(angle)
 
         for j in range(len(scales)):
             scale = scales[j]       
